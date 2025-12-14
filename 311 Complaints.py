@@ -1,39 +1,33 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import pydeck as pdk
 
-# ------------------------------------------------------------
-# Page config
-# ------------------------------------------------------------
+# -------------------------------
+# Page setup
+# -------------------------------
 st.set_page_config(
     page_title="Listening to NYC: 311 Complaints Story Dashboard",
     page_icon="📞",
     layout="wide",
 )
 
-st.markdown("## 📞 Listening to NYC: A 311 Complaints Story Dashboard")
+st.markdown("## 📞 Listening to NYC: 311 Complaints Story Dashboard")
 st.caption(
-    "A storytelling dashboard that explores *what* New Yorkers report, *when* they report it, "
-    "*how fast* issues are resolved, and *where* complaint hotspots appear — with dynamic narratives."
+    "An interactive, story-driven dashboard exploring what New Yorkers report, when they report it, "
+    "how fast requests are resolved, and where hotspots appear. Narratives update dynamically with your filters."
 )
 
-# ------------------------------------------------------------
-# Data Loading
-# ------------------------------------------------------------
+# -------------------------------
+# Data loader (robust)
+# -------------------------------
 @st.cache_data(show_spinner=True)
 def load_data():
-    # Put your compressed file in the repo root (recommended)
-    candidates = [
-        "nyc311_12months.csv.gz",
-        "nyc311_12months.csv",
-        "nyc311_sample.csv.gz",
-        "nyc311_sample.csv",
-    ]
-
-    df, source = None, None
-    for fname in candidates:
+    # Try common filenames so you don't have to change code when swapping datasets
+    for fname in ["nyc311_12months.csv.gz", "nyc311_12months.csv",
+                  "nyc311_sample.csv.gz", "nyc311_sample.csv"]:
         try:
             if fname.endswith(".gz"):
                 df = pd.read_csv(fname, compression="gzip", low_memory=False)
@@ -42,14 +36,14 @@ def load_data():
             source = fname
             break
         except Exception:
-            continue
+            df, source = None, None
 
     if df is None:
         raise FileNotFoundError(
-            "No local CSV found. Add `nyc311_12months.csv.gz` (or a small sample) to the repo root."
+            "No local CSV found. Place `nyc311_12months.csv.gz` (or a small sample) beside app.py."
         )
 
-    # Parse datetime fields
+    # Parse datetimes
     for c in ["created_date", "closed_date"]:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
@@ -68,7 +62,7 @@ def load_data():
         if col in df.columns:
             df[col] = df[col].fillna("Unspecified")
 
-    # Performance: categories reduce memory + speed groupby
+    # Convert to category for performance (but we will cast to str where needed)
     for col in ["borough", "complaint_type", "status", "day_of_week", "month"]:
         if col in df.columns:
             df[col] = df[col].astype("category")
@@ -79,26 +73,40 @@ def load_data():
 df, source = load_data()
 st.success(f"Loaded data from `{source}`")
 
-# ------------------------------------------------------------
-# Sidebar Filters
-# ------------------------------------------------------------
+# -------------------------------
+# Sidebar filters
+# -------------------------------
 st.sidebar.header("🔎 Filters")
 
-day_options = ["All"] + sorted(df["day_of_week"].dropna().unique().tolist()) if "day_of_week" in df else ["All"]
+# Day of week
+day_options = ["All"] + sorted(df["day_of_week"].dropna().unique().tolist()) if "day_of_week" in df.columns else ["All"]
 day_pick = st.sidebar.selectbox("Day of Week", day_options, index=0)
 
+# Hour range
 hour_range = st.sidebar.slider("Hour range (24h)", 0, 23, (0, 23))
 
-boro_options = ["All"] + sorted(df["borough"].dropna().unique().tolist()) if "borough" in df else ["All"]
+# Borough(s) - EXCLUDE "Unspecified" from the filter options
+if "borough" in df.columns:
+    boro_clean = df["borough"].astype(str)
+    boro_clean = boro_clean[boro_clean.str.strip().str.lower() != "unspecified"]
+    boro_options = ["All"] + sorted(boro_clean.dropna().unique().tolist())
+else:
+    boro_options = ["All"]
+
 boro_pick = st.sidebar.multiselect("Borough(s)", boro_options, default=["All"])
 
+# Top N complaint types
 top_n = st.sidebar.slider("Top complaint types to show", 5, 30, 15)
 
+# Map points cap (performance)
 map_points = st.sidebar.slider("Map points (performance)", 500, 8000, 3000, step=500)
+st.sidebar.caption(
+    "Limits how many records are drawn on the map. More points = more detail but slower interaction."
+)
 
-# ------------------------------------------------------------
-# Cached filtering
-# ------------------------------------------------------------
+# -------------------------------
+# Apply filters (cached)
+# -------------------------------
 @st.cache_data(show_spinner=False)
 def apply_filters(df, day_pick, hour_range, boro_pick):
     df_f = df.copy()
@@ -110,7 +118,8 @@ def apply_filters(df, day_pick, hour_range, boro_pick):
         df_f = df_f[(df_f["hour"] >= hour_range[0]) & (df_f["hour"] <= hour_range[1])]
 
     if "All" not in boro_pick and "borough" in df_f.columns:
-        df_f = df_f[df_f["borough"].isin(boro_pick)]
+        # Compare as strings to avoid categorical issues
+        df_f = df_f[df_f["borough"].astype(str).isin(list(boro_pick))]
 
     return df_f
 
@@ -118,83 +127,81 @@ def apply_filters(df, day_pick, hour_range, boro_pick):
 df_f = apply_filters(df, day_pick, hour_range, tuple(boro_pick))
 rows_after = len(df_f)
 
-# ------------------------------------------------------------
-# KPIs
-# ------------------------------------------------------------
+# -------------------------------
+# KPI row
+# -------------------------------
 c1, c2, c3, c4 = st.columns(4)
+
 c1.metric("Rows (after filters)", f"{rows_after:,}")
 
-pct_closed = df_f["status"].eq("Closed").mean() * 100 if ("status" in df_f.columns and rows_after) else 0.0
+pct_closed = df_f["status"].astype(str).eq("Closed").mean() * 100 if ("status" in df_f.columns and rows_after) else 0.0
 c2.metric("% Closed", f"{pct_closed:.1f}%")
 
 median_hours = df_f["hours_to_close"].median() if ("hours_to_close" in df_f.columns and rows_after) else np.nan
 c3.metric("Median Hours to Close", "-" if np.isnan(median_hours) else f"{median_hours:.1f}")
 
-top_type = df_f["complaint_type"].mode().iat[0] if ("complaint_type" in df_f.columns and rows_after) else "—"
+top_type = df_f["complaint_type"].astype(str).mode().iat[0] if ("complaint_type" in df_f.columns and rows_after) else "—"
 c4.metric("Top Complaint Type", top_type)
 
-# ------------------------------------------------------------
-# Dynamic headline narrative (changes with filters)
-# ------------------------------------------------------------
+# -------------------------------
+# Dynamic headline narrative
+# -------------------------------
 def headline_narrative(df_f, pct_closed, median_hours):
     if df_f.empty:
-        return "No records match the current filters. Try expanding time/day/borough selections."
+        return "No records match the current filters. Try broadening the day/hour/borough selection."
 
-    top_type = df_f["complaint_type"].mode().iat[0] if "complaint_type" in df_f.columns else "Unknown"
-    top_boro = df_f["borough"].mode().iat[0] if "borough" in df_f.columns else "Unknown"
+    top_type = df_f["complaint_type"].astype(str).mode().iat[0] if "complaint_type" in df_f.columns else "Unknown"
+    top_boro = df_f["borough"].astype(str).mode().iat[0] if "borough" in df_f.columns else "Unknown"
     peak_hour = int(df_f["hour"].value_counts().idxmax()) if "hour" in df_f.columns else None
 
     msg = (
-        f"**Story headline:** Under the current filters, **{top_type}** is the most common complaint. "
-        f"The city closes **{pct_closed:.1f}%** of these requests, and the median time to close is "
-        f"**{median_hours:.1f} hours**."
+        f"**Story headline:** Under the current filters, **{top_type}** is the most reported issue. "
+        f"The closure rate is **{pct_closed:.1f}%**, and the median closure time is **{median_hours:.1f} hours**."
     )
     if peak_hour is not None:
         msg += f" Reports peak around **{peak_hour:02d}:00**."
-    msg += f" The highest volume borough in this view is **{top_boro}**."
+    msg += f" The highest-volume borough in this view is **{top_boro}**."
     return msg
 
 
 st.info(headline_narrative(df_f, pct_closed, median_hours))
 
-# ------------------------------------------------------------
-# Recommendation box (simple decision-support behavior)
-# ------------------------------------------------------------
+# -------------------------------
+# Operational recommendation (simple decision-support)
+# -------------------------------
 def operational_recommendation(df_f):
     if df_f.empty or "complaint_type" not in df_f.columns:
         return "No recommendation available for the current selection."
-    top = str(df_f["complaint_type"].mode().iat[0]).upper()
 
+    top = str(df_f["complaint_type"].astype(str).mode().iat[0]).upper()
     if "HEAT" in top:
-        return "Increase winter staffing and prioritize heating complaint workflows during cold months."
+        return "Increase winter capacity and prioritize heating workflows during cold months."
     if "NOISE" in top:
         return "Allocate late-night and weekend enforcement resources to noise-related complaints."
     if "PARKING" in top:
-        return "Consider targeted parking enforcement during peak complaint hours and busy seasons."
-    return "Use complaint volume and resolution trends from this view to guide staffing and routing decisions."
+        return "Target parking enforcement during peak complaint hours and busy seasons."
+    return "Use the dominant complaint type and time patterns in this view to guide staffing and routing."
 
 
 st.warning(f"**Operational Recommendation:** {operational_recommendation(df_f)}")
 
-# ------------------------------------------------------------
-# Tabs = Chapters (storytelling flow)
-# ------------------------------------------------------------
+# -------------------------------
+# Tabs (story chapters)
+# -------------------------------
 tab1, tab2, tab3, tab4 = st.tabs(["1) What", "2) When", "3) How fast", "4) Where"])
 
-# Warm palette for some charts
 WARM = ["#8B0000", "#B22222", "#DC143C", "#FF4500", "#FF7F50", "#FFA500", "#FFB347", "#FFD580"]
 
-
-# =========================
+# --------------------------------
 # TAB 1: WHAT
-# =========================
+# --------------------------------
 with tab1:
     st.subheader("📊 What are New Yorkers reporting?")
-    st.caption("This section shows the most frequent complaint categories under the current filters.")
+    st.caption("Top complaint categories under the current filters.")
 
     if rows_after and "complaint_type" in df_f.columns:
         counts = (
-            df_f["complaint_type"]
+            df_f["complaint_type"].astype(str)
             .value_counts()
             .head(top_n)
             .rename_axis("Complaint Type")
@@ -206,7 +213,7 @@ with tab1:
             share = 100 * lead["Count"] / counts["Count"].sum()
 
             st.markdown(
-                f"**Narrative:** The leading complaint is **{lead['Complaint Type']}** with **{int(lead['Count']):,}** requests "
+                f"**Narrative:** **{lead['Complaint Type']}** leads with **{int(lead['Count']):,}** requests "
                 f"(~**{share:.1f}%** of the displayed top categories)."
             )
 
@@ -229,7 +236,7 @@ with tab1:
             st.plotly_chart(fig_bar, use_container_width=True)
 
             st.markdown(
-                f"**Takeaway:** In this view, complaint demand is concentrated in a few categories, led by "
+                f"**Takeaway:** Complaint demand is concentrated in a few categories, led by "
                 f"**{lead['Complaint Type']}**, which can guide targeted staffing and enforcement priorities."
             )
         else:
@@ -237,13 +244,12 @@ with tab1:
     else:
         st.info("No data available for these filters.")
 
-
-# =========================
+# --------------------------------
 # TAB 2: WHEN
-# =========================
+# --------------------------------
 with tab2:
     st.subheader("🔥 When do complaints happen?")
-    st.caption("This section highlights daily and hourly reporting rhythms.")
+    st.caption("Hourly and weekly reporting rhythms.")
 
     if rows_after and {"day_of_week", "hour"}.issubset(df_f.columns):
         order_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -252,7 +258,7 @@ with tab2:
             .size()
             .reset_index(name="Requests")
         )
-        heat["day_of_week"] = pd.Categorical(heat["day_of_week"], categories=order_days, ordered=True)
+        heat["day_of_week"] = pd.Categorical(heat["day_of_week"].astype(str), categories=order_days, ordered=True)
         heat = heat.sort_values(["day_of_week", "hour"])
 
         fig_heat = px.density_heatmap(
@@ -276,19 +282,20 @@ with tab2:
             )
 
         st.markdown(
-            "**Takeaway:** Complaint reporting follows consistent weekly and hourly cycles, which can help "
-            "agencies schedule staffing around predictable peak windows."
+            "**Takeaway:** Complaint reporting follows consistent daily and weekly cycles, supporting staffing plans "
+            "around predictable peak windows."
         )
 
-        # Animated bar (top 6 categories)
+        # Animated bar: top 6 categories
         if "complaint_type" in df_f.columns:
-            top6 = df_f["complaint_type"].value_counts().head(6).index
+            top6 = df_f["complaint_type"].astype(str).value_counts().head(6).index
             df_anim = (
-                df_f[df_f["complaint_type"].isin(top6)]
+                df_f[df_f["complaint_type"].astype(str).isin(top6)]
                 .groupby(["hour", "complaint_type"])
                 .size()
                 .reset_index(name="Requests")
             )
+            df_anim["complaint_type"] = df_anim["complaint_type"].astype(str)
 
             fig_anim = px.bar(
                 df_anim,
@@ -306,23 +313,23 @@ with tab2:
                 title_font=dict(size=18)
             )
             st.plotly_chart(fig_anim, use_container_width=True)
-
     else:
-        st.info("Not enough information to show time patterns for the current filters.")
+        st.info("Not enough information to show time patterns for this selection.")
 
-
-# =========================
+# --------------------------------
 # TAB 3: HOW FAST
-# =========================
+# --------------------------------
 with tab3:
     st.subheader("⏱️ How fast are requests resolved?")
-    st.caption("This section focuses on resolution time and potential delay patterns.")
+    st.caption("Resolution time differs by complaint type and operational workflow.")
 
     if rows_after and {"complaint_type", "hours_to_close"}.issubset(df_f.columns):
-        top_for_box = df_f["complaint_type"].value_counts().head(15).index
-        df_box = df_f[df_f["complaint_type"].isin(top_for_box)].copy()
+        top_for_box = df_f["complaint_type"].astype(str).value_counts().head(15).index
+        df_box = df_f[df_f["complaint_type"].astype(str).isin(top_for_box)].copy()
+
         df_box = df_box[df_box["hours_to_close"].notna()]
         df_box = df_box[(df_box["hours_to_close"] >= 0) & (df_box["hours_to_close"] <= 24 * 60)]  # keep sane range
+        df_box["complaint_type"] = df_box["complaint_type"].astype(str)
 
         fig_box = px.box(
             df_box, x="complaint_type", y="hours_to_close",
@@ -342,22 +349,22 @@ with tab3:
             st.markdown(f"**Narrative:** Slowest categories (median closure time) → {bullets}.")
 
         st.markdown(
-            "**Takeaway:** Resolution speed varies significantly by complaint type, suggesting that category-aware "
-            "prioritization and agency workflow differences strongly affect response performance."
+            "**Takeaway:** Resolution speed varies by complaint type, suggesting that category-aware prioritization "
+            "and agency workflows strongly influence outcomes."
         )
     else:
-        st.info("Resolution-time analysis is not available for the current selection.")
+        st.info("Resolution-time analysis is not available for this selection.")
 
-
-# =========================
-# TAB 4: WHERE (FAST MAP)
-# =========================
+# --------------------------------
+# TAB 4: WHERE (FAST WEBGL MAP)
+# --------------------------------
 with tab4:
-    st.subheader("🗺️ Where are complaint hotspots? (Fast WebGL Map)")
-    st.caption("This map uses WebGL for smooth interaction and fast hover tooltips.")
+    st.subheader("🗺️ Where are complaint hotspots? (Fast Map)")
+    st.caption("WebGL map for smooth pan/zoom and fast hover tooltips. Colored by status.")
 
     if rows_after and {"latitude", "longitude"}.issubset(df_f.columns):
         df_map = df_f.dropna(subset=["latitude", "longitude"]).copy()
+
         if df_map.empty:
             st.info("No geocoded rows available under the current filters.")
         else:
@@ -365,22 +372,24 @@ with tab4:
             sample_n = min(map_points, len(df_map))
             df_map = df_map.sample(sample_n, random_state=42)
 
+            # Tooltip-friendly fields
             df_map["hours_to_close_txt"] = df_map.get("hours_to_close", np.nan).apply(
                 lambda x: "N/A" if pd.isna(x) else f"{x:.1f}h"
             )
 
-            # Status -> RGB color
+            # Status -> RGB tuples (safe with categoricals)
             status_rgb = {
-                "Closed": [46, 125, 50],
-                "In Progress": [30, 136, 229],
-                "Open": [251, 140, 0],
-                "Assigned": [142, 36, 170],
-                "Pending": [244, 81, 30],
-                "Started": [57, 73, 171],
-                "Unspecified": [158, 158, 158],
+                "Closed": (46, 125, 50),
+                "In Progress": (30, 136, 229),
+                "Open": (251, 140, 0),
+                "Assigned": (142, 36, 170),
+                "Pending": (244, 81, 30),
+                "Started": (57, 73, 171),
+                "Unspecified": (158, 158, 158),
             }
-            df_map["status"] = df_map["status"].fillna("Unspecified")
-            df_map["color"] = df_map["status"].apply(lambda s: status_rgb.get(str(s), status_rgb["Unspecified"]))
+
+            df_map["status"] = df_map["status"].astype(str).fillna("Unspecified")
+            df_map["color"] = df_map["status"].map(lambda s: status_rgb.get(s, status_rgb["Unspecified"])).astype(object)
 
             layer = pdk.Layer(
                 "ScatterplotLayer",
@@ -409,28 +418,29 @@ with tab4:
                 "style": {"backgroundColor": "white", "color": "black"}
             }
 
-            st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip=tooltip),
-                            use_container_width=True)
+            st.pydeck_chart(
+                pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip=tooltip),
+                use_container_width=True
+            )
 
-            # “Hotspot narrative”: top borough + top complaint in mapped sample
-            top_boro_map = df_map["borough"].mode().iat[0] if "borough" in df_map.columns else "Unknown"
-            top_type_map = df_map["complaint_type"].mode().iat[0] if "complaint_type" in df_map.columns else "Unknown"
+            # Dynamic narrative based on the mapped sample
+            top_boro_map = df_map["borough"].astype(str).mode().iat[0] if "borough" in df_map.columns else "Unknown"
+            top_type_map = df_map["complaint_type"].astype(str).mode().iat[0] if "complaint_type" in df_map.columns else "Unknown"
 
             st.markdown(
-                f"**Narrative:** Within the mapped sample, complaints cluster most in **{top_boro_map}**, "
-                f"and the most common mapped complaint type is **{top_type_map}**."
+                f"**Narrative:** In the mapped sample, complaints cluster most in **{top_boro_map}**, "
+                f"and the most common complaint type is **{top_type_map}**."
             )
 
             st.markdown(
-                "**Takeaway:** Location patterns help identify where demand concentrates, supporting targeted field deployment "
-                "and neighborhood-level planning."
+                "**Takeaway:** Hotspots shift with filters. Use the map to identify where specific complaint types "
+                "concentrate and where response performance may require targeted attention."
             )
 
             with st.expander("Show sample rows used on the map"):
+                cols = [c for c in ["created_date", "complaint_type", "borough", "status", "hours_to_close"] if c in df_map.columns]
                 st.dataframe(
-                    df_map[["created_date", "complaint_type", "borough", "status", "hours_to_close"]]
-                    .sort_values("created_date", ascending=False)
-                    .head(50),
+                    df_map[cols].sort_values("created_date", ascending=False).head(50),
                     use_container_width=True
                 )
     else:
